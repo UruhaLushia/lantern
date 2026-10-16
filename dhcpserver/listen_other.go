@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build !linux && !darwin
 
 package dhcpserver
 
@@ -8,5 +8,5 @@ import (
 )
 
 func listen(string) (net.PacketConn, error) {
-	return nil, errors.New("active DHCP currently supports Linux only")
+	return nil, errors.New("active DHCP requires Linux or macOS")
 }

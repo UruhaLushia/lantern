@@ -1,0 +1,53 @@
+name: Linux
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      LANTERN_TEST_IFACE: lantern0
+      LANTERN_TEST_PEER: lantern1
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - name: Create isolated Ethernet pair
+        run: |
+          set -euxo pipefail
+          sudo ip link add lantern0 type veth peer name lantern1
+          sudo ip addr add 198.18.77.1/24 dev lantern0
+          sudo ip addr add 198.18.77.2/24 dev lantern1
+          sudo ip link set lantern0 up
+          sudo ip link set lantern1 up
+          sudo ip -6 addr add fe80::77:1/64 dev lantern0 nodad
+          sudo ip -6 addr add fe80::77:2/64 dev lantern1 nodad
+          sudo ip -6 addr add fd00:77::1/64 dev lantern0 nodad
+          sudo ip -6 addr add fd00:77::2/64 dev lantern1 nodad
+      - name: Test packet IO, DHCP, RA and routing
+        run: go test -race -p=1 -exec 'sudo -E' -v -timeout=90s ./...
+      - name: Network diagnostics on failure
+        if: failure()
+        run: |
+          ip -details addr show dev lantern0 || true
+          ip -details addr show dev lantern1 || true
+          ip rule show
+          ip -6 rule show
+          ip route show table all
+          ip -6 route show table all
+      - name: Remove Ethernet pair
+        if: always()
+        run: sudo ip link delete lantern0 2>/dev/null || true

@@ -1,3 +1,5 @@
+//go:build linux || darwin
+
 package discovery
 
 import (
@@ -12,7 +14,6 @@ import (
 	"github.com/UruhaLushia/lantern/internal/ether"
 	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/mdlayher/packet"
-	"golang.org/x/sys/unix"
 )
 
 func ProbeDHCP(ctx context.Context, name string, timeout time.Duration) (result DHCPProbe, err error) {
@@ -35,11 +36,7 @@ func ProbeDHCP(ctx context.Context, name string, timeout time.Duration) (result 
 	if len(iface.HardwareAddr) != 6 || iface.Flags&net.FlagUp == 0 || iface.Flags&(net.FlagLoopback|net.FlagPointToPoint) != 0 {
 		return result, errors.New("DHCP probe requires an up Ethernet LAN interface")
 	}
-	filter, err := ether.ControlFilter()
-	if err != nil {
-		return result, err
-	}
-	c, err := packet.Listen(iface, packet.Raw, unix.ETH_P_ALL, &packet.Config{Filter: filter})
+	c, err := ether.Listen(iface)
 	if err != nil {
 		return result, err
 	}

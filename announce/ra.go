@@ -13,6 +13,7 @@ import (
 
 	"github.com/UruhaLushia/lantern/discovery"
 	"github.com/mdlayher/ndp"
+	"golang.org/x/net/ipv6"
 )
 
 type Prefix struct {
@@ -101,7 +102,7 @@ type Upstream struct {
 type Service struct {
 	opts          Options
 	iface         net.Interface
-	conn          *ndp.Conn
+	conn          ndpConn
 	upstream      func() Upstream
 	mu            sync.Mutex
 	status        Status
@@ -113,12 +114,18 @@ type Service struct {
 	targetUpdates chan []netip.Addr
 }
 
+type ndpConn interface {
+	WriteTo(ndp.Message, *ipv6.ControlMessage, netip.Addr) error
+	SetWriteDeadline(time.Time) error
+	Close() error
+}
+
 func Start(ctx context.Context, iface net.Interface, opts Options, upstream func() Upstream) (*Service, error) {
 	opts, err := opts.Normalize()
 	if err != nil {
 		return nil, err
 	}
-	c, src, err := ndp.Listen(&iface, ndp.LinkLocal)
+	c, src, err := listenNDP(&iface)
 	if err != nil {
 		return nil, err
 	}

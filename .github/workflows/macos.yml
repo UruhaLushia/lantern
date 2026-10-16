@@ -1,0 +1,56 @@
+name: macOS
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel, macos-26, macos-26-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      LANTERN_TEST_IFACE: feth0
+      LANTERN_TEST_PEER: feth1
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - name: Create isolated Ethernet pair
+        run: |
+          set -euxo pipefail
+          sudo ifconfig feth0 create
+          sudo ifconfig feth1 create
+          sudo ifconfig feth0 peer feth1
+          sudo ifconfig feth0 inet 198.18.77.1 netmask 255.255.255.0 up
+          sudo ifconfig feth1 inet 198.18.77.2 netmask 255.255.255.0 up
+          sudo ifconfig feth0 inet6 fd00:77::1 prefixlen 64 alias
+          sudo ifconfig feth1 inet6 fd00:77::2 prefixlen 64 alias
+          sleep 3
+      - name: Test packet IO, DHCP, RA and routing
+        run: go test -race -p=1 -exec 'sudo -E' -v -timeout=90s ./...
+      - name: Network diagnostics on failure
+        if: failure()
+        run: |
+          ifconfig feth0 || true
+          ifconfig feth1 || true
+          netstat -rn -f inet
+          netstat -rn -f inet6
+      - name: Remove Ethernet pair
+        if: always()
+        run: |
+          sudo ifconfig feth0 destroy 2>/dev/null || true
+          sudo ifconfig feth1 destroy 2>/dev/null || true

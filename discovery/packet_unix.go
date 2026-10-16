@@ -1,3 +1,5 @@
+//go:build linux || darwin
+
 package discovery
 
 import (
@@ -10,15 +12,10 @@ import (
 	"github.com/UruhaLushia/lantern/device"
 	"github.com/UruhaLushia/lantern/internal/ether"
 	"github.com/mdlayher/packet"
-	"golang.org/x/sys/unix"
 )
 
 func Start(ctx context.Context, iface net.Interface, opts Options, store *device.Store) (*Service, error) {
-	filter, err := ether.ControlFilter()
-	if err != nil {
-		return nil, err
-	}
-	c, err := packet.Listen(&iface, packet.Raw, unix.ETH_P_ALL, &packet.Config{Filter: filter})
+	c, err := ether.Listen(&iface)
 	if err != nil {
 		return nil, err
 	}

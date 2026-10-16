@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build !linux && !darwin
 
 package discovery
 
@@ -9,5 +9,5 @@ import (
 )
 
 func ProbeDHCP(context.Context, string, time.Duration) (DHCPProbe, error) {
-	return DHCPProbe{}, errors.New("DHCP probing currently requires Linux")
+	return DHCPProbe{}, errors.New("DHCP probing requires Linux or macOS")
 }

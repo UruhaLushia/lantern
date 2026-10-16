@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build !linux && !darwin
 
 package discovery
 
@@ -11,8 +11,8 @@ import (
 )
 
 func Start(context.Context, net.Interface, Options, *device.Store) (*Service, error) {
-	return nil, errors.New("packet discovery currently requires Linux")
+	return nil, errors.New("packet discovery requires Linux or macOS")
 }
 func (*Service) Send([]byte, net.HardwareAddr) error {
-	return errors.New("packet transmission currently requires Linux")
+	return errors.New("packet transmission requires Linux or macOS")
 }
