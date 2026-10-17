@@ -181,6 +181,8 @@ func (s *Service) loop(ctx context.Context) {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	next := time.Now()
+	solicitAfter := next.Add(time.Duration(rand.Int64N(int64(time.Second))))
+	var solicitations int
 	var last time.Time
 	var wasReady bool
 	for {
@@ -231,9 +233,26 @@ func (s *Service) loop(ctx context.Context) {
 			}
 			s.mu.Unlock()
 			wasReady = false
+			if u.Router.Address.IsLinkLocalUnicast() && solicitations < 3 && !now.Before(solicitAfter) {
+				_ = s.conn.SetWriteDeadline(now.Add(time.Second))
+				if err := s.conn.WriteTo(&ndp.RouterSolicitation{Options: []ndp.Option{
+					&ndp.LinkLayerAddress{Direction: ndp.Source, Addr: s.iface.HardwareAddr},
+				}}, nil, netip.MustParseAddr("ff02::2")); err != nil {
+					s.mu.Lock()
+					s.status.LastError = fmt.Sprintf("request upstream RA: %v", err)
+					s.mu.Unlock()
+				}
+				solicitations++
+				solicitAfter = now.Add(4 * time.Second)
+			}
 			next = now.Add(time.Second)
 			continue
 		}
+		s.mu.Lock()
+		s.status.SuspendedReason = ""
+		s.mu.Unlock()
+		solicitations = 0
+		solicitAfter = now.Add(time.Duration(rand.Int64N(int64(time.Second))))
 		if !wasReady {
 			next = now
 			wasReady = true

@@ -423,7 +423,7 @@ func (c *Controller) reconcile(selected network.Selection, interfaces []network.
 					return announce.Upstream{Router: r, Ready: true}
 				}
 			}
-			return announce.Upstream{Reason: "waiting for RA from selected physical upstream"}
+			return announce.Upstream{Router: discovery.Router{Address: selected.GatewayIPv6}, Reason: "waiting for RA from selected physical upstream"}
 		})
 		if err != nil {
 			problems = append(problems, "RA: "+err.Error())
