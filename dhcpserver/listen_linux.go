@@ -4,10 +4,11 @@ import (
 	"context"
 	"golang.org/x/sys/unix"
 	"net"
+	"net/netip"
 	"syscall"
 )
 
-func listen(iface string) (net.PacketConn, error) {
+func listen(iface string, _ netip.Addr) (net.PacketConn, error) {
 	config := net.ListenConfig{Control: func(_, _ string, raw syscall.RawConn) error {
 		var inner error
 		err := raw.Control(func(fd uintptr) { inner = unix.SetsockoptString(int(fd), unix.SOL_SOCKET, unix.SO_BINDTODEVICE, iface) })

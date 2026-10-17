@@ -75,19 +75,23 @@ type DHCPEvent struct {
 	SourceIP  netip.Addr
 	SourceMAC net.HardwareAddr
 	Tagged    bool
+	// IP-level Windows capture has no Ethernet sender. ClientHWAddr remains a
+	// DHCP claim, never a verified source MAC. Unix capture retains its check.
+	LinkAddressUnavailable bool
 }
 
 type Service struct {
-	iface  net.Interface
-	opts   Options
-	store  *device.Store
-	mu     sync.Mutex
-	status Status
-	onDHCP func(DHCPEvent)
-	onRS   func(netip.Addr)
-	conn   frameConn
-	cancel context.CancelFunc
-	done   chan struct{}
+	iface       net.Interface
+	opts        Options
+	store       *device.Store
+	mu          sync.Mutex
+	status      Status
+	onDHCP      func(DHCPEvent)
+	onRS        func(netip.Addr)
+	conn        frameConn
+	cancel      context.CancelFunc
+	done        chan struct{}
+	closeNative func() error
 }
 
 type frameConn interface {
@@ -120,7 +124,17 @@ func (v Status) Clone() Status {
 	return v
 }
 
-func (s *Service) Close() error { s.cancel(); err := s.conn.Close(); <-s.done; return err }
+func (s *Service) Close() error {
+	s.cancel()
+	var err error
+	if s.conn != nil {
+		err = s.conn.Close()
+	} else if s.closeNative != nil {
+		err = s.closeNative()
+	}
+	<-s.done
+	return err
+}
 
 func (s *Service) observe(mac net.HardwareAddr, ip netip.Addr, source string, evidence ...device.Evidence) {
 	_ = s.store.Observe(device.Observation{Interface: s.iface.Name, MAC: mac, IP: ip, Source: source, Evidence: evidence, TTL: s.opts.AddressTTL})

@@ -1,0 +1,5 @@
+internal/wininject/bundle/WinDivert.dll -text
+internal/wininject/bundle/WinDivert64.sys -text
+internal/wininject/bundle/WinDivert-2.2.2-source.zip -text
+# Preserve the upstream license verbatim, including its trailing blank line.
+internal/wininject/bundle/LICENSE -text -whitespace

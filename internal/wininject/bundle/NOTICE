@@ -1,0 +1,39 @@
+WinDivert 2.2.2-A (Windows amd64)
+Copyright (C) 2019, basil.
+
+Lantern uses the unmodified WinDivert shared library and driver under LGPLv3.
+The complete upstream license (LGPLv3, GPLv3, GPLv2) is in LICENSE.
+WinDivert comes WITHOUT ANY WARRANTY. See LICENSE for the full terms.
+
+Binary release:
+https://github.com/basil00/WinDivert/releases/tag/v2.2.2
+https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip
+Release archive SHA256:
+63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15
+
+Files copied verbatim from the release's x64 directory:
+WinDivert.dll SHA256:
+c1e060ee19444a259b2162f8af0f3fe8c4428a1c6f694dce20de194ac8d7d9a2
+WinDivert64.sys SHA256:
+8da085332782708d8767bcace5327a6ec7283c17cfb85e40b03cd2323a90ddc2
+
+Corresponding upstream source, including headers and build scripts, is supplied
+as WinDivert-2.2.2-source.zip, downloaded without changes from:
+https://codeload.github.com/basil00/WinDivert/zip/refs/tags/v2.2.2
+Source archive SHA256:
+65ec79c9e6afa99f648a3f4d1f6db794640b40d0b65bd438770ea503ee14ecb7
+
+On 2026-10-17 Windows Authenticode verification of the bundled driver returned
+Valid. The DLL is not Authenticode-signed. Runtime hash checks establish that
+extracted files match this bundle; they do not check for upstream updates or
+certify compatibility with other drivers.
+
+The files are extracted alongside this notice before use. They remain separate
+shared-library files on disk; they are not statically linked into Lantern.
+To use an interface-compatible modified WinDivert library, supply its absolute
+directory with lantern.WindowsGatewayOptions.DriverDirectory. This explicit
+override bypasses the bundled-file hashes. Administrator rights and a Windows
+accepted driver signature are still required by Windows where applicable.
+Modification of WinDivert and reverse engineering to debug those modifications
+are permitted under the supplied license. No WinDivert service is automatically
+removed or upgraded by Lantern.

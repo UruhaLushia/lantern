@@ -3,12 +3,13 @@ package dhcpserver
 import (
 	"context"
 	"net"
+	"net/netip"
 	"syscall"
 
 	"golang.org/x/sys/unix"
 )
 
-func listen(name string) (net.PacketConn, error) {
+func listen(name string, _ netip.Addr) (net.PacketConn, error) {
 	iface, err := net.InterfaceByName(name)
 	if err != nil {
 		return nil, err

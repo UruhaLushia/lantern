@@ -160,7 +160,7 @@ func (s *Service) dhcp(f ether.Frame, d ether.Datagram) {
 		_ = s.store.Observe(device.Observation{Interface: s.iface.Name, MAC: p.ClientHWAddr, IP: ip, Source: "dhcp", Evidence: e, TTL: ttl})
 	}
 	if callback != nil {
-		callback(DHCPEvent{Packet: p, SourceIP: d.Source, SourceMAC: slices.Clone(f.SourceMAC), Tagged: f.Tagged})
+		callback(DHCPEvent{Packet: p, SourceIP: d.Source, SourceMAC: slices.Clone(f.SourceMAC), Tagged: f.Tagged, LinkAddressUnavailable: len(f.SourceMAC) == 0})
 	}
 }
 

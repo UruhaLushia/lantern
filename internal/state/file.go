@@ -25,8 +25,11 @@ func Load(path string, dst any) error {
 	if err != nil {
 		return err
 	}
-	if !os.SameFile(info, i) || !i.Mode().IsRegular() || i.Mode().Perm()&0077 != 0 || i.Size() > 32<<20 {
+	if !os.SameFile(info, i) || !i.Mode().IsRegular() || i.Size() > 32<<20 {
 		return errors.New("state must be a private regular file (0600)")
+	}
+	if err := privateFile(f); err != nil {
+		return err
 	}
 	d := json.NewDecoder(io.LimitReader(f, 32<<20))
 	d.DisallowUnknownFields()
@@ -62,6 +65,10 @@ func Save(path string, value any) error {
 		return err
 	}
 	defer os.Remove(f.Name())
+	if err := makePrivate(f); err != nil {
+		_ = f.Close()
+		return err
+	}
 	if _, err := f.Write(b); err != nil {
 		_ = f.Close()
 		return err
@@ -73,13 +80,8 @@ func Save(path string, value any) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(f.Name(), path); err != nil {
+	if err := replaceFile(f.Name(), path); err != nil {
 		return err
 	}
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
+	return syncDirectory(dir)
 }

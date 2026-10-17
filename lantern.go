@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/netip"
 	"reflect"
-	"runtime"
 	"slices"
 	"sync"
 	"time"
@@ -23,35 +22,38 @@ import (
 
 var (
 	ErrAlreadyStarted      = errors.New("controller has already been started; create a new controller to restart")
-	ErrUnsupportedPlatform = errors.New("lantern currently supports Linux and macOS only")
+	ErrUnsupportedPlatform = errors.New("unsupported gateway platform; Windows IPv4 requires explicit WindowsGateway options")
 )
 
 type Options struct {
-	Interface    string
-	GatewayIPv4  netip.Addr
-	GatewayIPv6  netip.Addr
-	PollInterval time.Duration
-	Logger       *slog.Logger
-	Discovery    discovery.Options
-	RA           announce.Options
-	DHCP         dhcpserver.Options
-	MaxDevices   int
-	DeviceStore  *device.Store
+	WindowsGateway *WindowsGatewayOptions
+	Interface      string
+	GatewayIPv4    netip.Addr
+	GatewayIPv6    netip.Addr
+	PollInterval   time.Duration
+	Logger         *slog.Logger
+	Discovery      discovery.Options
+	RA             announce.Options
+	DHCP           dhcpserver.Options
+	MaxDevices     int
+	DeviceStore    *device.Store
 }
 
 type Status struct {
-	State     string             `json:"state"`
-	StartedAt time.Time          `json:"started_at,omitzero"`
-	UpdatedAt time.Time          `json:"updated_at,omitzero"`
-	Network   network.Snapshot   `json:"network"`
-	Selection *network.Selection `json:"selection,omitempty"`
-	Problems  []string           `json:"problems,omitempty"`
-	Discovery discovery.Status   `json:"discovery"`
-	RA        announce.Status    `json:"ra"`
-	DHCP      dhcpserver.Status  `json:"dhcp"`
+	IPv4Gateway IPv4GatewayStatus  `json:"ipv4_gateway"`
+	State       string             `json:"state"`
+	StartedAt   time.Time          `json:"started_at,omitzero"`
+	UpdatedAt   time.Time          `json:"updated_at,omitzero"`
+	Network     network.Snapshot   `json:"network"`
+	Selection   *network.Selection `json:"selection,omitempty"`
+	Problems    []string           `json:"problems,omitempty"`
+	Discovery   discovery.Status   `json:"discovery"`
+	RA          announce.Status    `json:"ra"`
+	DHCP        dhcpserver.Status  `json:"dhcp"`
 }
 
 type Controller struct {
+	datapath          platformDatapath
 	opts              Options
 	lifeMu            sync.Mutex
 	probeMu           sync.Mutex
@@ -73,6 +75,14 @@ type Controller struct {
 }
 
 func New(opts Options) (*Controller, error) {
+	if opts.WindowsGateway != nil {
+		copy := *opts.WindowsGateway
+		copy.Clients = slices.Clone(copy.Clients)
+		opts.WindowsGateway = &copy
+		if !copy.LocalIPv4.Is4() || !copy.LocalIPv4.IsGlobalUnicast() || copy.EgressInterface == "" || copy.BatchSize < 0 || copy.BatchSize > 16 {
+			return nil, errors.New("Windows gateway requires a LAN IPv4, an explicit egress interface and batch size 0..16")
+		}
+	}
 	if opts.Interface == "" {
 		opts.Interface = "auto"
 	}
@@ -139,8 +149,8 @@ func (c *Controller) Start(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
-		return ErrUnsupportedPlatform
+	if err := validatePlatform(c.opts); err != nil {
+		return err
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	c.cancel, c.started = cancel, true
@@ -205,6 +215,9 @@ func (c *Controller) Status() Status {
 	}
 	c.mu.RUnlock()
 	c.resources.Lock()
+	if c.datapath != nil {
+		s.IPv4Gateway = c.datapath.Snapshot()
+	}
 	if c.observer != nil {
 		s.Discovery = c.observer.Snapshot()
 	}
@@ -362,13 +375,23 @@ func (c *Controller) reconcile(selected network.Selection, interfaces []network.
 		c.resourceSelection, c.resourceAddresses = &selected, addresses
 	}
 	var problems []string
+	var err error
+	if c.datapath != nil && c.datapath.Ready() != nil {
+		c.closeResourcesLocked()
+	}
+	if c.datapath == nil {
+		c.datapath, err = startPlatformDatapath(selected, c.opts)
+		if err != nil {
+			return []string{"IPv4 forwarding: " + err.Error()}
+		}
+	}
 	iface, err := net.InterfaceByIndex(selected.Interface.Index)
 	if err != nil {
 		return []string{err.Error()}
 	}
 
 	if c.opts.Discovery.Enabled && c.observer == nil {
-		c.observer, err = discovery.Start(context.Background(), *iface, c.opts.Discovery, c.deviceStore)
+		c.observer, err = startPlatformDiscovery(context.Background(), *iface, c.opts.Discovery, c.deviceStore, c.datapath)
 		if err != nil {
 			problems = append(problems, "discovery: "+err.Error())
 		}
@@ -415,7 +438,23 @@ func (c *Controller) reconcile(selected network.Selection, interfaces []network.
 				return append(problems, "client routing: "+err.Error())
 			}
 		}
-		c.dhcp, err = dhcpserver.Start(context.Background(), selected, c.opts.DHCP, c.observer, c.deviceStore, func() error {
+		dhcpOpts := c.opts.DHCP
+		if c.datapath != nil {
+			datapath := c.datapath
+			previousHook := dhcpOpts.OnLease
+			dhcpOpts.OnLease = func(l dhcpserver.Lease, selected bool) error {
+				if previousHook != nil {
+					if err := previousHook(l, selected); err != nil {
+						return err
+					}
+				}
+				return datapath.SetLease(l.MAC, l.IP, l.ExpiresAt, selected && l.State == "bound")
+			}
+		}
+		c.dhcp, err = dhcpserver.Start(context.Background(), selected, dhcpOpts, c.observer, c.deviceStore, func() error {
+			if c.datapath != nil {
+				return c.datapath.Ready()
+			}
 			return network.ForwardingReady(iface.Name, true, false)
 		})
 		if err != nil {
@@ -500,6 +539,15 @@ func (c *Controller) closeResourcesLocked() {
 		c.mu.Unlock()
 		c.observer = nil
 	}
+	if c.datapath != nil {
+		if err := c.datapath.Close(); err != nil {
+			c.recordCleanupError(err)
+		}
+		c.mu.Lock()
+		c.status.IPv4Gateway = c.datapath.Snapshot()
+		c.mu.Unlock()
+		c.datapath = nil
+	}
 	c.resourceSelection, c.resourceAddresses = nil, nil
 	if c.clientRoutes != nil {
 		if err := c.clientRoutes.Close(); err != nil {
@@ -528,7 +576,7 @@ func (c *Controller) syncClientRoutesLocked() error {
 			continue
 		}
 		for _, address := range d.Addresses {
-			if address.IP.Is6() {
+			if address.IP.Is6() && c.datapath == nil {
 				addresses = append(addresses, address.IP)
 			}
 		}

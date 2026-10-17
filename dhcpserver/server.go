@@ -35,6 +35,9 @@ type Options struct {
 	Lease         time.Duration `json:"lease_ns"`
 	LeaseFile     string        `json:"lease_file"`
 	ObserveWindow time.Duration `json:"observe_window_ns"`
+	// OnLease prepares or revokes forwarding before acknowledging a binding.
+	// It is called under the lease lock and must not call back into Service.
+	OnLease func(Lease, bool) error `json:"-"`
 }
 
 func (o Options) Normalize() (Options, error) {
@@ -69,6 +72,11 @@ func (o Options) Normalize() (Options, error) {
 	}
 	if len(o.DNS) == 0 {
 		return o, errors.New("active DHCP requires explicit reachable DNS addresses")
+	}
+	for _, ip := range o.DNS {
+		if !ip.IsValid() {
+			return o, errors.New("DHCP DNS entries must be valid IPv4 addresses")
+		}
 	}
 	o.AllowedMACs = slices.Clone(o.AllowedMACs)
 	o.DNS = slices.Clone(o.DNS)
@@ -140,13 +148,21 @@ type savedState struct {
 	PausedReason string  `json:"paused_reason"`
 	Leases       []Lease `json:"leases"`
 }
+
+// packetObserver permits isolated protocol tests without opening a physical
+// network interface. Keep Start's existing discovery.Service API unchanged.
+type packetObserver interface {
+	SetDHCPHandler(func(discovery.DHCPEvent))
+	Send([]byte, net.HardwareAddr) error
+}
+
 type Service struct {
 	reservedByMAC map[string]netip.Addr
 	reservedByIP  map[netip.Addr]string
 	excluded      map[netip.Addr]bool
 	opts          Options
 	selected      network.Selection
-	observer      *discovery.Service
+	observer      packetObserver
 	store         *device.Store
 	ready         func() error
 	mu            sync.Mutex
@@ -155,9 +171,23 @@ type Service struct {
 	cancel        context.CancelFunc
 	done          chan struct{}
 	socket        net.PacketConn
+	transmit      func([]byte, net.HardwareAddr) error
 }
 
 func Start(ctx context.Context, selected network.Selection, opts Options, observer *discovery.Service, store *device.Store, ready func() error) (*Service, error) {
+	if observer == nil {
+		return nil, errors.New("active DHCP requires an observer")
+	}
+	return start(ctx, selected, opts, observer, store, ready, listen, sendReplyFrame)
+}
+
+func start(ctx context.Context, selected network.Selection, opts Options, observer packetObserver, store *device.Store, ready func() error, open func(string, netip.Addr) (net.PacketConn, error), send func(*Service, []byte, net.HardwareAddr) error) (*Service, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !opts.Enabled || observer == nil || store == nil || ready == nil {
+		return nil, errors.New("active DHCP requires enabled options, an observer, a device store and a readiness check")
+	}
 	opts, err := opts.Normalize()
 	if err != nil {
 		return nil, err
@@ -254,9 +284,18 @@ func Start(ctx context.Context, selected network.Selection, opts Options, observ
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("load DHCP leases: %w", err)
 	}
-	s.socket, err = listen(selected.Interface.Name)
+	s.socket, err = open(selected.Interface.Name, opts.ServerIP)
 	if err != nil {
 		return nil, err
+	}
+	s.transmit = observer.Send
+	if send != nil {
+		s.transmit = func(frame []byte, mac net.HardwareAddr) error { return send(s, frame, mac) }
+	}
+	for _, lease := range s.status.Leases {
+		if err := s.notifyLeaseLocked(lease); err != nil {
+			return nil, errors.Join(err, s.socket.Close())
+		}
 	}
 	ctx, s.cancel = context.WithCancel(ctx)
 	observer.SetDHCPHandler(s.Handle)
@@ -265,6 +304,9 @@ func Start(ctx context.Context, selected network.Selection, opts Options, observ
 }
 
 func (s *Service) Handle(event discovery.DHCPEvent) {
+	if event.Packet == nil {
+		return
+	}
 	if event.Packet.OpCode == dhcpv4.OpcodeBootReply {
 		server, offered := ipAddr(event.Packet.ServerIdentifier()), ipAddr(event.Packet.YourIPAddr)
 		if s.managed(offered) || server == s.opts.ServerIP {
@@ -317,7 +359,17 @@ func (s *Service) SetGatewayMACs(macs []string) error {
 	if err != nil {
 		return err
 	}
+	previous := s.opts.GatewayMACs
 	s.opts.GatewayMACs = normalized
+	for _, lease := range s.status.Leases {
+		if err := s.notifyLeaseLocked(lease); err != nil {
+			s.opts.GatewayMACs = previous
+			for _, old := range s.status.Leases {
+				err = errors.Join(err, s.notifyLeaseLocked(old))
+			}
+			return err
+		}
+	}
 	return nil
 }
 
@@ -383,7 +435,7 @@ func (s *Service) loop(ctx context.Context, prefix int) {
 
 func (s *Service) process(ctx context.Context, event discovery.DHCPEvent, prefix int) {
 	p := event.Packet
-	if p.OpCode != dhcpv4.OpcodeBootRequest || event.Tagged || len(p.ClientHWAddr) != 6 || p.ClientHWAddr[0]&1 != 0 || slices.Equal(p.ClientHWAddr, make([]byte, 6)) || !slices.Equal(p.ClientHWAddr, event.SourceMAC) || (!ipAddr(p.GatewayIPAddr).IsUnspecified() && ipAddr(p.GatewayIPAddr).IsValid()) || p.HopCount != 0 {
+	if p == nil || p.OpCode != dhcpv4.OpcodeBootRequest || event.Tagged || len(p.ClientHWAddr) != 6 || p.ClientHWAddr[0]&1 != 0 || slices.Equal(p.ClientHWAddr, make([]byte, 6)) || (!event.LinkAddressUnavailable && !slices.Equal(p.ClientHWAddr, event.SourceMAC)) || (!ipAddr(p.GatewayIPAddr).IsUnspecified() && ipAddr(p.GatewayIPAddr).IsValid()) || p.HopCount != 0 {
 		return
 	}
 	mac := p.ClientHWAddr.String()
@@ -466,6 +518,12 @@ func (s *Service) process(ctx context.Context, event discovery.DHCPEvent, prefix
 		}
 		l.ExpiresAt = time.Now().Add(s.opts.Lease)
 		err := s.saveLocked()
+		if err == nil {
+			err = s.notifyLeaseLocked(*l)
+		}
+		if err != nil {
+			s.status.LastError = err.Error()
+		}
 		s.mu.Unlock()
 		if err != nil {
 			return
@@ -481,6 +539,9 @@ func (s *Service) process(ctx context.Context, event discovery.DHCPEvent, prefix
 					l.ExpiresAt = time.Now().Add(time.Hour)
 				} else {
 					l.ExpiresAt = time.Now()
+				}
+				if err := s.notifyLeaseLocked(*l); err != nil {
+					s.status.LastError = err.Error()
 				}
 			}
 		}
@@ -608,6 +669,7 @@ func (s *Service) reply(request *dhcpv4.DHCPv4, yi netip.Addr, kind dhcpv4.Messa
 		dns[i] = ip.AsSlice()
 	}
 	mod := []dhcpv4.Modifier{dhcpv4.WithMessageType(kind), dhcpv4.WithYourIP(yi.AsSlice()), dhcpv4.WithServerIP(s.opts.ServerIP.AsSlice()), dhcpv4.WithOption(dhcpv4.OptServerIdentifier(s.opts.ServerIP.AsSlice())), dhcpv4.WithOption(dhcpv4.OptRouter(s.gatewayFor(request.ClientHWAddr).AsSlice())), dhcpv4.WithOption(dhcpv4.OptDNS(dns...)), dhcpv4.WithNetmask(net.CIDRMask(prefix, 32))}
+	mod = append(mod, dhcpv4.WithClientIP(request.ClientIPAddr))
 	if request.MessageType() != dhcpv4.MessageTypeInform {
 		mod = append(mod, dhcpv4.WithOption(dhcpv4.OptIPAddressLeaseTime(s.opts.Lease)))
 	}
@@ -627,7 +689,7 @@ func (s *Service) reply(request *dhcpv4.DHCPv4, yi netip.Addr, kind dhcpv4.Messa
 	localMAC, _ := net.ParseMAC(s.selected.Interface.MAC)
 	frame, err := ether.IPv4UDP(localMAC, mac, s.opts.ServerIP, dst, 67, 68, p.ToBytes())
 	if err == nil {
-		err = s.observer.Send(frame, mac)
+		err = s.transmit(frame, mac)
 	}
 	if err != nil {
 		s.status.LastError = err.Error()
@@ -644,4 +706,11 @@ func (s *Service) reply(request *dhcpv4.DHCPv4, yi netip.Addr, kind dhcpv4.Messa
 				}})
 		}
 	}
+}
+
+func (s *Service) notifyLeaseLocked(l Lease) error {
+	if s.opts.OnLease != nil {
+		return s.opts.OnLease(l, slices.Contains(s.opts.GatewayMACs, l.MAC))
+	}
+	return nil
 }

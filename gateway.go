@@ -40,23 +40,26 @@ func (c *Controller) ConfigureGateway(opts GatewayOptions) error {
 	validated, err := New(next)
 	if err == nil {
 		next = validated.opts
+		err = validatePlatform(next)
+	}
+	if err == nil {
 		var snapshot network.Snapshot
 		snapshot, err = network.Discover()
 		if err == nil {
 			_, err = snapshot.Select(next.Interface, next.GatewayIPv4, next.GatewayIPv6)
 		}
 	}
-	if err == nil {
-		err = c.configureGatewayLocked(next)
+	if err != nil {
+		// Validation has changed no resources. In particular, do not reconcile
+		// (and potentially open native handles) for a rejected configuration.
+		c.resources.Unlock()
+		return err
 	}
+	err = c.configureGatewayLocked(next)
 	c.resources.Unlock()
 	if err == nil {
 		c.refreshLocked()
-		s := c.Status()
-		if (next.DHCP.Enabled && !s.DHCP.Running) ||
-			(next.RA.Enabled && s.Selection != nil && s.Selection.GatewayIPv6.IsValid() && !s.RA.Enabled) {
-			err = fmt.Errorf("gateway configuration could not be applied: %v", s.Problems)
-		}
+		err = gatewayConfigurationError(next, c.Status())
 	}
 	if err != nil {
 		c.resources.Lock()
@@ -64,6 +67,19 @@ func (c *Controller) ConfigureGateway(opts GatewayOptions) error {
 		c.resources.Unlock()
 		c.refreshLocked()
 		return errors.Join(err, rollbackErr)
+	}
+	return nil
+}
+
+func gatewayConfigurationError(opts Options, s Status) error {
+	// A running DHCP socket alone does not establish that Windows can forward
+	// the leases it advertises. Check static-client configurations as well.
+	if opts.WindowsGateway != nil && !s.IPv4Gateway.Running {
+		return fmt.Errorf("gateway configuration could not be applied: IPv4 datapath is not running (last error: %s; problems: %v)", s.IPv4Gateway.LastError, s.Problems)
+	}
+	if (opts.DHCP.Enabled && !s.DHCP.Running) ||
+		(opts.RA.Enabled && s.Selection != nil && s.Selection.GatewayIPv6.IsValid() && !s.RA.Enabled) {
+		return fmt.Errorf("gateway configuration could not be applied: %v", s.Problems)
 	}
 	return nil
 }
@@ -79,6 +95,9 @@ func (c *Controller) configureGatewayLocked(next Options) error {
 		c.status.DHCP = c.dhcp.Snapshot()
 		c.mu.Unlock()
 		c.dhcp = nil
+		if c.datapath != nil {
+			c.datapath.ClearLeases()
+		}
 	}
 	c.opts.Interface, c.opts.GatewayIPv4, c.opts.GatewayIPv6 = next.Interface, next.GatewayIPv4, next.GatewayIPv6
 	c.opts.RA, c.opts.DHCP = next.RA, next.DHCP

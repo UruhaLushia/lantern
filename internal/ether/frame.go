@@ -109,22 +109,29 @@ func UDP(d Datagram) (Datagram, error) {
 }
 
 func Checksum(parts ...[]byte) uint16 {
-	var sum uint32
+	var sum uint64
 	var odd bool
 	var pending byte
 	for _, b := range parts {
-		for _, v := range b {
-			if !odd {
-				pending = v
-				odd = true
-			} else {
-				sum += uint32(pending)<<8 | uint32(v)
-				odd = false
-			}
+		if odd && len(b) != 0 {
+			sum += uint64(pending)<<8 | uint64(b[0])
+			b, odd = b[1:], false
+		}
+		for len(b) >= 8 {
+			sum += uint64(binary.BigEndian.Uint16(b[:2])) + uint64(binary.BigEndian.Uint16(b[2:4])) +
+				uint64(binary.BigEndian.Uint16(b[4:6])) + uint64(binary.BigEndian.Uint16(b[6:8]))
+			b = b[8:]
+		}
+		for len(b) >= 2 {
+			sum += uint64(binary.BigEndian.Uint16(b[:2]))
+			b = b[2:]
+		}
+		if len(b) != 0 {
+			pending, odd = b[0], true
 		}
 	}
 	if odd {
-		sum += uint32(pending) << 8
+		sum += uint64(pending) << 8
 	}
 	for sum>>16 != 0 {
 		sum = (sum & 0xffff) + (sum >> 16)
