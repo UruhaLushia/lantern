@@ -70,7 +70,7 @@ func (c *ClientRoutes) Sync(addresses []netip.Addr) error {
 			continue
 		}
 		if m := existing[ip]; owned && c.direct(m) && m.Flags&unix.RTF_PROTO1 != 0 {
-			if err := c.change(ip, unix.RTM_DELETE); err != nil && !errors.Is(err, unix.ESRCH) {
+			if _, err := c.change(ip, unix.RTM_DELETE); err != nil && !errors.Is(err, unix.ESRCH) {
 				errs = append(errs, fmt.Errorf("remove client route %s: %w", ip, err))
 				continue
 			}
@@ -86,10 +86,10 @@ func (c *ClientRoutes) Sync(addresses []netip.Addr) error {
 			}
 			continue
 		}
-		if err := c.change(ip, unix.RTM_ADD); err != nil {
+		if owned, err := c.add(ip); err != nil {
 			errs = append(errs, fmt.Errorf("add client route %s: %w", ip, err))
 		} else {
-			c.entries[ip] = true
+			c.entries[ip] = owned
 		}
 	}
 	return errors.Join(errs...)
@@ -100,7 +100,29 @@ func (c *ClientRoutes) direct(m *route.RouteMessage) bool {
 		m.Flags&(unix.RTF_GATEWAY|unix.RTF_REJECT|unix.RTF_BLACKHOLE) == 0
 }
 
-func (c *ClientRoutes) change(ip netip.Addr, kind int) error {
+func (c *ClientRoutes) add(ip netip.Addr) (bool, error) {
+	_, err := c.change(ip, unix.RTM_ADD)
+	if err == nil {
+		return true, nil
+	}
+	if !errors.Is(err, unix.EEXIST) {
+		return false, err
+	}
+	// ARP/NDP or another process may install the host route after the RIB
+	// snapshot. Reuse it only if an unscoped lookup confirms LAN egress.
+	m, lookupErr := c.change(ip, unix.RTM_GET)
+	if lookupErr != nil {
+		return false, errors.Join(err, fmt.Errorf("inspect existing route: %w", lookupErr))
+	}
+	if !c.direct(m) || m.Flags&unix.RTF_HOST == 0 || m.Flags&unix.RTF_IFSCOPE != 0 ||
+		len(m.Addrs) <= unix.RTAX_DST || routeAddr(m.Addrs[unix.RTAX_DST]) != ip {
+		return false, fmt.Errorf("%w; existing route does not provide direct unscoped egress on %s (interface %d, flags %#x)", err, c.iface.Name, m.Index, m.Flags)
+	}
+	// Borrowed routes must survive our shutdown, even if they carry PROTO1.
+	return false, nil
+}
+
+func (c *ClientRoutes) change(ip netip.Addr, kind int) (*route.RouteMessage, error) {
 	var dst route.Addr
 	if ip.Is4() {
 		dst = &route.Inet4Addr{IP: ip.As4()}
@@ -111,13 +133,21 @@ func (c *ClientRoutes) change(ip netip.Addr, kind int) error {
 	m := route.RouteMessage{Version: unix.RTM_VERSION, Type: kind,
 		Flags: unix.RTF_UP | unix.RTF_HOST | unix.RTF_STATIC | unix.RTF_PROTO1,
 		Index: c.iface.Index, ID: uintptr(os.Getpid()), Seq: c.seq,
-		Addrs: []route.Addr{unix.RTAX_DST: dst, unix.RTAX_GATEWAY: &route.LinkAddr{Index: c.iface.Index, Name: c.iface.Name}}}
+		Addrs: []route.Addr{
+			unix.RTAX_DST:     dst,
+			unix.RTAX_GATEWAY: &route.LinkAddr{Index: c.iface.Index, Name: c.iface.Name},
+			unix.RTAX_IFP:     &route.LinkAddr{Index: c.iface.Index, Name: c.iface.Name},
+		}}
+	if kind == unix.RTM_GET {
+		m.Flags = unix.RTF_HOST
+		m.Addrs = []route.Addr{unix.RTAX_DST: dst, unix.RTAX_IFP: &route.LinkAddr{}}
+	}
 	b, err := m.Marshal()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if _, err := unix.Write(c.fd, b); err != nil {
-		return err
+		return nil, err
 	}
 	buf := make([]byte, 64<<10)
 	end := time.Now().Add(2 * time.Second)
@@ -127,19 +157,19 @@ func (c *ClientRoutes) change(ip netip.Addr, kind int) error {
 			continue
 		}
 		if err != nil {
-			return err
+			return nil, err
 		}
 		messages, err := route.ParseRIB(route.RIBTypeRoute, buf[:n])
 		if err != nil {
-			return err
+			return nil, err
 		}
 		for _, msg := range messages {
 			if reply, ok := msg.(*route.RouteMessage); ok && reply.ID == m.ID && reply.Seq == m.Seq && reply.Type == kind {
-				return reply.Err
+				return reply, reply.Err
 			}
 		}
 	}
-	return os.ErrDeadlineExceeded
+	return nil, os.ErrDeadlineExceeded
 }
 
 func (c *ClientRoutes) Close() error {
